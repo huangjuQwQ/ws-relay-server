@@ -1,91 +1,85 @@
 const http = require('http');
-const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
 const SECRET_TOKEN = process.env.SECRET_TOKEN || 'change-me-to-a-long-random-string';
 
-// 在线表：userId -> { userId, name, socket }
+// 在线表：userId -> { userId, name, lastPing }
 const online = new Map();
 
-// 创建 HTTP 服务器，用于健康检查和 WebSocket 升级
-const server = http.createServer((req, res) => {
-    // 健康检查端点，Render 会定期访问
-    if (req.url === '/health' || req.url === '/') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('OK');
-        return;
-    }
-    res.writeHead(404);
-    res.end();
-});
-
-const wss = new WebSocket.Server({ server });
-
-function broadcast(type, data, excludeWs = null) {
-    const msg = JSON.stringify({ type, data });
-    for (const info of online.values()) {
-        if (info.socket !== excludeWs && info.socket.readyState === WebSocket.OPEN) {
-            info.socket.send(msg);
+function parseQuery(url) {
+    const query = {};
+    const index = url.indexOf('?');
+    if (index !== -1) {
+        const parts = url.slice(index + 1).split('&');
+        for (const part of parts) {
+            const [key, value] = part.split('=');
+            if (key && value) query[decodeURIComponent(key)] = decodeURIComponent(value);
         }
     }
+    return query;
 }
 
-wss.on('connection', (ws) => {
-    let selfId = null;
+// 定时清理超时玩家（15秒无心跳视为离线）
+setInterval(() => {
+    const now = Date.now();
+    for (const [uid, info] of online.entries()) {
+        if (now - info.lastPing > 15000) {
+            online.delete(uid);
+            console.log(`[自动清理] ${info.name} (${uid}) 超时下线`);
+        }
+    }
+}, 5000);
 
-    ws.on('message', (raw) => {
-        let msg;
-        try {
-            msg = JSON.parse(raw);
-        } catch {
-            return;
+const server = http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        return res.end();
+    }
+
+    const query = parseQuery(req.url);
+
+    // 1. 健康检查
+    if (req.url.startsWith('/health')) {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        return res.end('OK');
+    }
+
+    // 2. 上报在线 (客户端每5秒请求一次这个接口)
+    if (req.url.startsWith('/poll')) {
+        const { userId, name, token } = query;
+
+        if (token !== SECRET_TOKEN) {
+            res.writeHead(401);
+            return res.end('Invalid token');
         }
 
-        if (msg.type === 'join') {
-            // 鉴权
-            if (msg.token !== SECRET_TOKEN) {
-                ws.close(4001, 'Invalid token');
-                return;
-            }
-            selfId = String(msg.userId);
-            online.set(selfId, { userId: selfId, name: msg.name, socket: ws });
-
-            // 回发当前完整在线列表
-            ws.send(JSON.stringify({
-                type: 'sync',
-                data: Array.from(online.values()).map(o => ({ userId: o.userId, name: o.name }))
-            }));
-
-            // 通知其他人
-            broadcast('add', { userId: selfId, name: msg.name }, ws);
-            console.log(`[+] ${msg.name} (${selfId}) 上线，当前在线 ${online.size}`);
+        if (userId) {
+            online.set(userId, { userId: userId, name: name || 'Unknown', lastPing: Date.now() });
         }
 
-        if (msg.type === 'leave' && selfId) {
-            online.delete(selfId);
-            broadcast('remove', { userId: selfId }, ws);
-            console.log(`[-] ${selfId} 主动离开，当前在线 ${online.size}`);
-            selfId = null;
-        }
+        const list = Array.from(online.values()).map(o => ({ userId: o.userId, name: o.name }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ code: 200, data: list }));
+    }
 
-        if (msg.type === 'ping') {
-            ws.send(JSON.stringify({ type: 'pong' }));
+    // 3. 主动离开
+    if (req.url.startsWith('/leave')) {
+        const { userId } = query;
+        if (userId && online.has(userId)) {
+            online.delete(userId);
         }
-    });
+        res.writeHead(200);
+        return res.end('OK');
+    }
 
-    ws.on('close', () => {
-        if (selfId && online.has(selfId)) {
-            online.delete(selfId);
-            broadcast('remove', { userId: selfId });
-            console.log(`[x] ${selfId} 断线清理，当前在线 ${online.size}`);
-        }
-    });
-
-    ws.on('error', (err) => {
-        console.error('WebSocket error:', err.message);
-    });
+    res.writeHead(404);
+    res.end('Not Found');
 });
 
 server.listen(PORT, () => {
-    console.log(`中继服务器运行在端口 ${PORT}`);
+    console.log(`HTTP 轮询服务器运行在端口 ${PORT}`);
 });
